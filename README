@@ -1,0 +1,8 @@
+=== About
+This repository is for Player drivers I'm working on that aren't quite
+ready to be submitted upstream.  They may, however, still be useful to some
+people, so they're available.
+
+=== License
+Unless otherwise specified, all drivers are made available under the 
+terms of the GNU GPL v2 (or later) license.
