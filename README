@@ -6,3 +6,9 @@ people, so they're available.
 === License
 Unless otherwise specified, all drivers are made available under the 
 terms of the GNU GPL v2 (or later) license.
+
+=== Drivers
+* kinect: Driver for the Kinect based on libfreenect (github.com/OpenKinect/libfreenect).
+  * Dependencies: libusb-1.0
+                  libfreenect
+                  player >= 3.0
