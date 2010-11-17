@@ -33,7 +33,8 @@ LED control, these capabilities are under development.
 This driver is based on the original version of the libfreenect API, which
 is currently under heavy development.
 
-Heatmap code borrowed from "glview" example in libfreenect project
+Heatmap code and USB connection code based on "glview" example in libfreenect
+project:
 http://github.com/OpenKinect/libfreenect
 
 @par Compile-time dependencies
@@ -48,6 +49,8 @@ http://github.com/OpenKinect/libfreenect
 
 - @ref interface_camera - Color image (mandatory)
 - @ref interface_camera - Depth image (optional)
+- @ref interface_ptz - Tilt motor
+- @ref interface_imu - Accelerometer
 
 @par Configuration requests
 
@@ -66,7 +69,7 @@ http://github.com/OpenKinect/libfreenect
 driver
 (
   name "kinect"
-  provides ["color:::camera:0" "depth:::camera:1"]
+  provides ["color:::camera:0" "depth:::camera:1" "ptz:0" "imu:0"]
   heatmap 1
 )
 @endverbatim
@@ -75,7 +78,7 @@ driver
  */
 /** @} */
 
-//TODO: Add support for tilt, LEDs, and Accelerometer.
+//TODO: Add support for LEDs, calibrate accelerometers
 
 #if !defined (WIN32)
 #include <unistd.h>
@@ -89,14 +92,14 @@ driver
 
 
 // Callback functions for processing depth and color image buffers
-void DepthImageCallback(uint16_t *imagedata, int width, int height);
-void ColorImageCallback(uint8_t *imagedata, int width, int height);
+void DepthImageCallback(freenect_device *dev, freenect_depth *depth, uint32_t timestamp);
+void ColorImageCallback(freenect_device *dev, freenect_pixel *rgb, uint32_t timestamp);
 
 // Storage for image data and metadata
 static uint16_t* DepthImage;
 static uint8_t* ColorImage;
 static pthread_mutex_t kinect_mutex;
-static int cwidth, cheight, dwidth, dheight, newcdata, newddata;
+static int newcdata, newddata;
 
 ////////////////////////////////////////////////////////////////////////////////
 // The class for the driver
@@ -120,9 +123,13 @@ private:
 	virtual void MainQuit();
 	int PublishColorImage();
 	int PublishDepthImage();
+	int PublishPTZ();
+	int PublishAccelerometer();
 	int SetupPTZ();
 
 	// Handle to the kinect usb object
+	freenect_context *fctx;
+	freenect_device *fdev;
 	libusb_device_handle *usbdev;
 	libusb_device_handle *ptzdev;
 
@@ -135,15 +142,20 @@ private:
 	// Storage for outgoing camera data
 	player_camera_data_t colordata;
 	player_camera_data_t depthdata;
+	player_ptz_data_t ptzdata;
+	player_imu_data_calib_t imudata;
 
-	// Flags for interfaces we privide
+	// Flags for interfaces we provide
 	int providedepthimage;
 	int provideptz;
 	int provideimu;
 
+	double last_acc_pub;
+
 	// Config file options
 	int heatmap;
 	int downsample;
+
 
 	uint16_t t_gamma[2048];
 };
@@ -200,7 +212,6 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 		providedepthimage = 1;
 	}
 
-/* TODO: enable this.
 	// Check to see if we provide the PTZ interface
 	if (cf->ReadDeviceAddr(&(this->ptz_id), section, "provides", PLAYER_PTZ_CODE, -1, NULL))
 	{
@@ -230,8 +241,6 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 		}
 		provideimu = 1;
 	}
-*/
-
 	// Read config file options
 	heatmap = cf->ReadBool(section, "heatmap", false);
 	downsample = cf->ReadBool(section, "downsample", false);
@@ -240,7 +249,7 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 	usbdev = NULL;
 	ptzdev = NULL;
 
-	// Initialize the colormap lookup table
+	// Initialize the color map lookup table
 	for (int i=0; i<2048; i++) {
 			float v = i/2048.0;
 			v = powf(v, 3)* 6;
@@ -257,33 +266,35 @@ int KinectDriver::MainSetup()
 	PLAYER_MSG0(1,"Kinect driver initializing...");
 	kinect_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-	libusb_init(NULL);
-	usbdev = libusb_open_device_with_vid_pid(NULL, 0x45e, 0x2ae);
-	if (!usbdev) {
-		PLAYER_ERROR("Error opening connection to Kinect");
+	if (freenect_init(&fctx, NULL) < 0)
+	{
+		PLAYER_ERROR("Error initializing Kinect");
 		return -1;
 	}
-	libusb_claim_interface(usbdev, 0);
+	if (freenect_open_device(fctx, &fdev, 0) < 0)
+	{
+		PLAYER_ERROR("Error opening Kinect");
+		return -1;
+	}
 
-	PLAYER_MSG0(1,"Kinect driver ready.");
-	printf("Kinect device is %i\n", libusb_get_device_address(libusb_get_device(usbdev)));
-
-	cams_init(usbdev, DepthImageCallback, ColorImageCallback);
+	freenect_set_depth_callback(fdev, DepthImageCallback);
+	freenect_set_rgb_callback(fdev, ColorImageCallback);
+	freenect_set_rgb_format(fdev, FREENECT_FORMAT_RGB);
 
 	colordata.image = NULL;
 	depthdata.image = NULL;
 
-	cwidth = 0;
-	cheight = 0;
-	dwidth = 0;
-	dheight = 0;
+	freenect_start_depth(fdev);
+	freenect_start_rgb(fdev);
 
+
+	int success = 0;
 	if (provideptz || provideimu)
 	{
-		SetupPTZ();
+		success = SetupPTZ();
 	}
 
-	return(0);
+	return(success);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -292,9 +303,8 @@ void KinectDriver::MainQuit()
 {
 	PLAYER_MSG0(2,"Kinect driver shutting down...");
 
-	// Close and release the USB device
-	libusb_close(usbdev);
-	usbdev = NULL;
+	freenect_stop_depth(fdev);
+	freenect_stop_rgb(fdev);
 
 	if (provideptz || provideimu)
 	{
@@ -308,7 +318,7 @@ void KinectDriver::MainQuit()
 // Setup PTZ USB port
 int KinectDriver::SetupPTZ()
 {
-/*
+
 	ptzdev = libusb_open_device_with_vid_pid(NULL, 0x45e, 0x2b0);
 	if (!ptzdev) {
 		PLAYER_ERROR("Error opening connection to Kinect");
@@ -318,9 +328,19 @@ int KinectDriver::SetupPTZ()
 
 	libusb_set_configuration(ptzdev, 0);
 
-	libusb_control_transfer(ptzdev, 0xC0, 0x10, 0x0, 0x0, 0, 1, 1);*/
 
-	return -1;
+	unsigned char data[128];
+	memset(data, 0, sizeof(data));
+	libusb_control_transfer(ptzdev, 0xC0, 0x10, 0x0, 0x0, data, sizeof(data), 1);
+	if (data[0] != 0x22)
+	{
+		PLAYER_ERROR("Error initializing Kinect's tilt motor");
+		return -1;
+	}
+	libusb_control_transfer(ptzdev, 0x40, 0x6, 0x1, 0x0, data, sizeof(data), 0);
+	PLAYER_MSG0(4, "Kinect tilt motor initialized successfully!");
+
+	return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -329,6 +349,30 @@ int KinectDriver::ProcessMessage(QueuePointer & resp_queue,
 		player_msghdr * hdr,
 		void * data)
 {
+	if (Message::MatchMessage(hdr, PLAYER_MSGTYPE_CMD, PLAYER_PTZ_CMD_STATE, this->ptz_id))
+	{
+		player_ptz_cmd_t *ptzcmd = (player_ptz_cmd_t*) data;
+
+		double tiltcmd = ptzcmd->tilt * 180 / M_PI;
+		if (tiltcmd < 0 || tiltcmd > 21.0)
+		{
+			PLAYER_WARN1("Kinect tilt command %f out of range, ignoring...", ptzcmd->tilt * 180.0 / M_PI);
+		}
+		else
+		{
+			// There are 63 steps of freedom, about 3 per degree of freedom.
+			double delta = 3.0 * tiltcmd;
+			unsigned char lower = 255 - round(delta);
+			uint16_t cmd = 0xFF00 | lower;
+
+			PLAYER_MSG1(3, "Sending Kinect tilt command of %x", cmd);
+			unsigned char usbdata[32];
+			libusb_control_transfer(ptzdev, 0x40, 0x31, cmd, 0x0, usbdata, sizeof(usbdata), 0);
+
+			this->ptzdata.tilt = ptzcmd->tilt;
+		}
+		return 0;
+	}
 	// This driver does not handle incoming messages, return -1
 	return(-1);
 }
@@ -336,24 +380,21 @@ int KinectDriver::ProcessMessage(QueuePointer & resp_queue,
 // Publish color image data to camera interface
 int KinectDriver::PublishColorImage()
 {
-	if (cwidth!=640 || cheight!=480)
-		return -1;
-
 	if (colordata.image){
 		delete[] colordata.image;
 	}
-	colordata.image = new uint8_t[cheight*cwidth*3];
+	colordata.image = new uint8_t[FREENECT_RGB_SIZE];
 
 	pthread_mutex_lock(&kinect_mutex);
-	colordata.width = cwidth;
-	colordata.height = cheight;
-	memcpy(colordata.image, ColorImage, 3*cwidth*cheight);
+	colordata.width = FREENECT_FRAME_W;
+	colordata.height = FREENECT_FRAME_H;
+	memcpy(colordata.image, ColorImage, FREENECT_RGB_SIZE);
 	pthread_mutex_unlock(&kinect_mutex);
 
 	colordata.bpp = 24;
 	colordata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 	colordata.fdiv = 1;
-	colordata.image_count = cwidth*cheight*3;
+	colordata.image_count = FREENECT_RGB_SIZE;
 	colordata.format = PLAYER_CAMERA_FORMAT_RGB888;
 
 	PLAYER_MSG2(4,"Writing Color Image size %d, %d", colordata.width, colordata.height);
@@ -368,20 +409,17 @@ int KinectDriver::PublishColorImage()
 int KinectDriver::PublishDepthImage()
 {
 
-	if (dwidth!=640 || dheight!=480)
-		return -1;
-
 	if (depthdata.image){
 		delete[] depthdata.image;
 	}
-	depthdata.image = new uint8_t[dheight*dwidth*3];
+	depthdata.image = new uint8_t[FREENECT_RGB_SIZE];
 
 	if (heatmap) // Publish colorized RGB888
 	{
 		pthread_mutex_lock(&kinect_mutex);
-		depthdata.width = dwidth;
-		depthdata.height = dheight;
-		for (int i=0; i<640*480; i++) {
+		depthdata.width = FREENECT_FRAME_W;
+		depthdata.height = FREENECT_FRAME_H;
+		for (int i=0; i<FREENECT_FRAME_W*FREENECT_FRAME_H; i++) {
 			int pval = t_gamma[DepthImage[i]];
 			int lb = pval & 0xff;
 			switch (pval>>8) {
@@ -427,15 +465,15 @@ int KinectDriver::PublishDepthImage()
 		depthdata.bpp = 24;
 		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 		depthdata.fdiv = 1;
-		depthdata.image_count = dwidth*dheight*3;
+		depthdata.image_count = FREENECT_RGB_SIZE;
 		depthdata.format = PLAYER_CAMERA_FORMAT_RGB888;
 	}
 	else if (downsample) //Publish downsampled MONO8
 	{
 		pthread_mutex_lock(&kinect_mutex);
-		depthdata.width = dwidth;
-		depthdata.height = dheight;
-		for (int i=0; i < dwidth*dheight; i++)
+		depthdata.width = FREENECT_FRAME_W;
+		depthdata.height = FREENECT_FRAME_H;
+		for (int i=0; i < FREENECT_FRAME_W* FREENECT_FRAME_H; i++)
 		{
 			uint16_t pixel = DepthImage[i];
 			uint8_t dpixel = (uint8_t)((double)pixel / 2048.0 * 255.0); 
@@ -446,28 +484,46 @@ int KinectDriver::PublishDepthImage()
 		depthdata.bpp = 8;
 		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 		depthdata.fdiv = 1;
-		depthdata.image_count = dwidth * dheight;
+		depthdata.image_count = FREENECT_FRAME_W * FREENECT_FRAME_H;
 		depthdata.format = PLAYER_CAMERA_FORMAT_MONO8;
 	}
 	else // Publish MONO16	
 	{
 		pthread_mutex_lock(&kinect_mutex);
-		depthdata.width = dwidth;
-		depthdata.height = dheight;
-		memcpy((void*)depthdata.image, (void*)DepthImage, dwidth*dheight*sizeof(uint16_t));
+		depthdata.width = FREENECT_FRAME_W;
+		depthdata.height = FREENECT_FRAME_H;
+		memcpy((void*)depthdata.image, (void*)DepthImage, FREENECT_DEPTH_SIZE);
 		pthread_mutex_unlock(&kinect_mutex);
 
 
 		depthdata.bpp = 16;
 		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 		depthdata.fdiv = 1;
-		depthdata.image_count = dwidth * dheight * 2;
+		depthdata.image_count = FREENECT_DEPTH_SIZE;
 		depthdata.format = PLAYER_CAMERA_FORMAT_MONO16;
 	}
 
 	PLAYER_MSG2(4,"Writing Depth Image size %d, %d", depthdata.width, depthdata.height);
 	newddata = 0;
 	Publish(depth_camera_id, PLAYER_MSGTYPE_DATA, PLAYER_CAMERA_DATA_STATE, (void*)&depthdata);
+
+	return 0;
+}
+int KinectDriver::PublishPTZ()
+{
+	Publish(this->ptz_id, PLAYER_MSGTYPE_DATA, PLAYER_PTZ_DATA_STATE, (void*)&ptzdata, sizeof(ptzdata));
+	return 0;
+}
+
+int KinectDriver::PublishAccelerometer()
+{
+	unsigned char usbdata[32];
+	libusb_control_transfer(ptzdev, 0xC0, 0x32, 0x0, 0x0, usbdata, sizeof(usbdata), 2);
+	imudata.accel_x = (int8_t)(usbdata[2] << 8 | usbdata[3]);
+	imudata.accel_y = (int8_t)(usbdata[4] << 8 | usbdata[5]);
+	imudata.accel_z = (int8_t)(usbdata[6] << 8 | usbdata[7]);
+
+	Publish(this->imu_id, PLAYER_MSGTYPE_DATA, PLAYER_IMU_DATA_CALIB, (void*)&imudata, sizeof(imudata));
 
 	return 0;
 }
@@ -482,7 +538,7 @@ void KinectDriver::Main()
 		pthread_testcancel();
 
 		// Cycle libusb
-		libusb_handle_events(NULL);
+		freenect_process_events(fctx);
 
 		// Process incoming messages.  KinectDriver::ProcessMessage() is
 		// called on each message.
@@ -497,14 +553,18 @@ void KinectDriver::Main()
 		{
 			PublishDepthImage();
 		}
-
-		// Sleep for a while so as not to hog the system
-		usleep(10);
+		double now;
+		GlobalTime->GetTimeDouble(&now);
+		if (provideimu && (now - last_acc_pub) > .05)
+		{
+			PublishAccelerometer();
+			GlobalTime->GetTimeDouble(&last_acc_pub);
+		}
 	}
 }
 ////////////////////////////////////////////////////////////////////////////////
 // Grab depth image buffer returned by libfreenect and store it in a static buffer
-void DepthImageCallback(uint16_t *imagedata, int width, int height)
+void DepthImageCallback(freenect_device *dev, freenect_depth *imagedata, uint32_t timestamp)
 {
 	pthread_mutex_lock(&kinect_mutex);
 	if(DepthImage)
@@ -512,28 +572,23 @@ void DepthImageCallback(uint16_t *imagedata, int width, int height)
 		delete[] DepthImage;
 	}
 
-	DepthImage = new uint16_t[width*height];
-	memcpy(DepthImage, imagedata, width*height*sizeof(uint16_t));
-	dwidth = width;
-	dheight = height;
+	DepthImage = new uint16_t[FREENECT_DEPTH_SIZE];
+	memcpy(DepthImage, imagedata, FREENECT_DEPTH_SIZE);
 	newddata = 1;
 	pthread_mutex_unlock(&kinect_mutex);
 	return;
 }
 ////////////////////////////////////////////////////////////////////////////////
 // Grab color image buffer returned by libfreenect and store it in a static buffer
-void ColorImageCallback(uint8_t *imagedata, int width, int height)
+void ColorImageCallback(freenect_device *dev, freenect_pixel *imagedata, uint32_t timestamp)
 {
 	pthread_mutex_lock(&kinect_mutex);
 	if(ColorImage)
 	{
 		delete[] ColorImage;
 	}
-	ColorImage = new uint8_t[width*height*3];
-	memcpy(ColorImage, imagedata, 3*width*height);
-	printf("Setting size (%d, %d)\n",width, height);
-	cwidth = width;
-	cheight = height;
+	ColorImage = new uint8_t[FREENECT_RGB_SIZE];
+	memcpy(ColorImage, imagedata, FREENECT_RGB_SIZE);
 	newcdata = 1;
 	pthread_mutex_unlock(&kinect_mutex);
 	return;
