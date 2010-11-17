@@ -1,7 +1,7 @@
 /*
- *  Player - One Hell of a Robot Server
- *  Copyright (C) 2003
- *     Brian Gerkey
+ *	Kinect Driver for Player
+ *  Copyright (C) 2010
+ *     Rich Mattes
  *
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -29,6 +29,12 @@
 the RGB Color images and the greyscale depth images provided by the Kinect.
 The Kinect also supports motor control for PTZ, accelerometers, audio and
 LED control, these capabilities are under development.
+
+This driver is based on the original version of the libfreenect API, which
+is currently under heavy development.
+
+Heatmap code borrowed from "glview" example in libfreenect project
+http://github.com/OpenKinect/libfreenect
 
 @par Compile-time dependencies
 
@@ -68,6 +74,8 @@ driver
 @authors Rich Mattes
  */
 /** @} */
+
+//TODO: Add support for tilt, LEDs, and Accelerometer.
 
 #if !defined (WIN32)
 #include <unistd.h>
@@ -160,7 +168,11 @@ void KinectDriver_Register(DriverTable* table)
 KinectDriver::KinectDriver(ConfigFile* cf, int section)
 : ThreadedDriver(cf, section)
 {
+	// Initialize flags:
 	providedepthimage = 0;
+	provideptz = 0;
+	provideimu = 0;
+
 	//Add interface from Configuration File
 	if (cf->ReadDeviceAddr(&(this->color_camera_id), section, "provides", PLAYER_CAMERA_CODE, -1, "image"))
 	{
@@ -188,6 +200,7 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 		providedepthimage = 1;
 	}
 
+/* TODO: enable this.
 	// Check to see if we provide the PTZ interface
 	if (cf->ReadDeviceAddr(&(this->ptz_id), section, "provides", PLAYER_PTZ_CODE, -1, NULL))
 	{
@@ -217,7 +230,7 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 		}
 		provideimu = 1;
 	}
-
+*/
 
 	// Read config file options
 	heatmap = cf->ReadBool(section, "heatmap", false);
@@ -295,6 +308,7 @@ void KinectDriver::MainQuit()
 // Setup PTZ USB port
 int KinectDriver::SetupPTZ()
 {
+/*
 	ptzdev = libusb_open_device_with_vid_pid(NULL, 0x45e, 0x2b0);
 	if (!ptzdev) {
 		PLAYER_ERROR("Error opening connection to Kinect");
@@ -304,7 +318,9 @@ int KinectDriver::SetupPTZ()
 
 	libusb_set_configuration(ptzdev, 0);
 
-	libusb_control_transfer(ptzdev, 0xC0, 0x10, 0x0, 0x0, 0, 1, 1);
+	libusb_control_transfer(ptzdev, 0xC0, 0x10, 0x0, 0x0, 0, 1, 1);*/
+
+	return -1;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -360,45 +376,7 @@ int KinectDriver::PublishDepthImage()
 	}
 	depthdata.image = new uint8_t[dheight*dwidth*3];
 
-	// If no heatmap, just publish image as MONO16
-	if (!heatmap)
-	{
-		if (!downsample)
-		{
-			pthread_mutex_lock(&kinect_mutex);
-			depthdata.width = dwidth;
-			depthdata.height = dheight;
-			memcpy((void*)depthdata.image, (void*)DepthImage, dwidth*dheight*sizeof(uint16_t));
-			pthread_mutex_unlock(&kinect_mutex);
-
-
-			depthdata.bpp = 16;
-			depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
-			depthdata.fdiv = 1;
-			depthdata.image_count = dwidth * dheight * 2;
-			depthdata.format = PLAYER_CAMERA_FORMAT_MONO16;
-		}
-		else
-		{
-			pthread_mutex_lock(&kinect_mutex);
-			depthdata.width = dwidth;
-			depthdata.height = dheight;
-			for (int i=0; i < dwidth*dheight; i++)
-			{
-				uint16_t pixel = DepthImage[i];
-				uint8_t dpixel = (uint8_t)((double)pixel / 2048.0 * 255.0); 
-				depthdata.image[i] = dpixel;
-			}
-			pthread_mutex_unlock(&kinect_mutex);
-
-			depthdata.bpp = 8;
-			depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
-			depthdata.fdiv = 1;
-			depthdata.image_count = dwidth * dheight;
-			depthdata.format = PLAYER_CAMERA_FORMAT_MONO8;
-		}
-	}
-	else	// We are using a heatmap, compute and publish as RGB888
+	if (heatmap) // Publish colorized RGB888
 	{
 		pthread_mutex_lock(&kinect_mutex);
 		depthdata.width = dwidth;
@@ -452,6 +430,41 @@ int KinectDriver::PublishDepthImage()
 		depthdata.image_count = dwidth*dheight*3;
 		depthdata.format = PLAYER_CAMERA_FORMAT_RGB888;
 	}
+	else if (downsample) //Publish downsampled MONO8
+	{
+		pthread_mutex_lock(&kinect_mutex);
+		depthdata.width = dwidth;
+		depthdata.height = dheight;
+		for (int i=0; i < dwidth*dheight; i++)
+		{
+			uint16_t pixel = DepthImage[i];
+			uint8_t dpixel = (uint8_t)((double)pixel / 2048.0 * 255.0); 
+			depthdata.image[i] = dpixel;
+		}
+		pthread_mutex_unlock(&kinect_mutex);
+
+		depthdata.bpp = 8;
+		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
+		depthdata.fdiv = 1;
+		depthdata.image_count = dwidth * dheight;
+		depthdata.format = PLAYER_CAMERA_FORMAT_MONO8;
+	}
+	else // Publish MONO16	
+	{
+		pthread_mutex_lock(&kinect_mutex);
+		depthdata.width = dwidth;
+		depthdata.height = dheight;
+		memcpy((void*)depthdata.image, (void*)DepthImage, dwidth*dheight*sizeof(uint16_t));
+		pthread_mutex_unlock(&kinect_mutex);
+
+
+		depthdata.bpp = 16;
+		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
+		depthdata.fdiv = 1;
+		depthdata.image_count = dwidth * dheight * 2;
+		depthdata.format = PLAYER_CAMERA_FORMAT_MONO16;
+	}
+
 	PLAYER_MSG2(4,"Writing Depth Image size %d, %d", depthdata.width, depthdata.height);
 	newddata = 0;
 	Publish(depth_camera_id, PLAYER_MSGTYPE_DATA, PLAYER_CAMERA_DATA_STATE, (void*)&depthdata);
