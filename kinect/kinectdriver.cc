@@ -63,6 +63,12 @@ http://github.com/OpenKinect/libfreenect
   - When set to false, the Depth image is published as a greyscale MONO16 image
   - When set to true, the Depth image is colorized and published as an RGB heatmap
 
+- downsample (bool)
+  - Default: false
+  - When set to false, the Depth image is published as a greyscale MONO16 image
+  - When set to true, the Depth image is downsampled into a greyscale MONO8 image
+  - If heatmap is set to true, this option has no effect.
+
 @par Example
 
 @verbatim
@@ -78,7 +84,7 @@ driver
  */
 /** @} */
 
-//TODO: Add support for LEDs, calibrate accelerometers
+//TODO: Add support for LEDs
 
 #if !defined (WIN32)
 #include <unistd.h>
@@ -121,11 +127,12 @@ private:
 	virtual void Main();
 	virtual int MainSetup();
 	virtual void MainQuit();
+
+	// Routines to publish different data
 	int PublishColorImage();
 	int PublishDepthImage();
 	int PublishPTZ();
 	int PublishAccelerometer();
-	int SetupPTZ();
 
 	// Handle to the kinect usb object
 	freenect_context *fctx;
@@ -151,6 +158,7 @@ private:
 	int provideimu;
 
 	double last_acc_pub;
+	double last_ptz_pub;
 
 	// Config file options
 	int heatmap;
@@ -280,6 +288,7 @@ int KinectDriver::MainSetup()
 	freenect_set_depth_callback(fdev, DepthImageCallback);
 	freenect_set_rgb_callback(fdev, ColorImageCallback);
 	freenect_set_rgb_format(fdev, FREENECT_FORMAT_RGB);
+	freenect_set_depth_format(fdev, FREENECT_FORMAT_11_BIT);
 
 	colordata.image = NULL;
 	depthdata.image = NULL;
@@ -287,14 +296,10 @@ int KinectDriver::MainSetup()
 	freenect_start_depth(fdev);
 	freenect_start_rgb(fdev);
 
+	last_acc_pub = 0;
+	last_ptz_pub = 0;
 
-	int success = 0;
-	if (provideptz || provideimu)
-	{
-		success = SetupPTZ();
-	}
-
-	return(success);
+	return(0);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -305,42 +310,9 @@ void KinectDriver::MainQuit()
 
 	freenect_stop_depth(fdev);
 	freenect_stop_rgb(fdev);
-
-	if (provideptz || provideimu)
-	{
-		libusb_close(ptzdev);
-		ptzdev = NULL;
-	}
+	freenect_shutdown(fctx);
 
 	PLAYER_MSG0(2,"Kinect driver has been shut down.");
-}
-////////////////////////////////////////////////////////////////////////////////
-// Setup PTZ USB port
-int KinectDriver::SetupPTZ()
-{
-
-	ptzdev = libusb_open_device_with_vid_pid(NULL, 0x45e, 0x2b0);
-	if (!ptzdev) {
-		PLAYER_ERROR("Error opening connection to Kinect");
-		return -1;
-	}
-	libusb_claim_interface(ptzdev, 0);
-
-	libusb_set_configuration(ptzdev, 0);
-
-
-	unsigned char data[128];
-	memset(data, 0, sizeof(data));
-	libusb_control_transfer(ptzdev, 0xC0, 0x10, 0x0, 0x0, data, sizeof(data), 1);
-	if (data[0] != 0x22)
-	{
-		PLAYER_ERROR("Error initializing Kinect's tilt motor");
-		return -1;
-	}
-	libusb_control_transfer(ptzdev, 0x40, 0x6, 0x1, 0x0, data, sizeof(data), 0);
-	PLAYER_MSG0(4, "Kinect tilt motor initialized successfully!");
-
-	return 0;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -353,21 +325,22 @@ int KinectDriver::ProcessMessage(QueuePointer & resp_queue,
 	{
 		player_ptz_cmd_t *ptzcmd = (player_ptz_cmd_t*) data;
 
-		double tiltcmd = ptzcmd->tilt * 180 / M_PI;
-		if (tiltcmd < 0 || tiltcmd > 21.0)
-		{
-			PLAYER_WARN1("Kinect tilt command %f out of range, ignoring...", ptzcmd->tilt * 180.0 / M_PI);
-		}
-		else
-		{
-			// There are 63 steps of freedom, about 3 per degree of freedom.
-			double delta = 3.0 * tiltcmd;
-			unsigned char lower = 255 - round(delta);
-			uint16_t cmd = 0xFF00 | lower;
+		int tiltcmd = round(ptzcmd->tilt * 180.0 / M_PI);
 
-			PLAYER_MSG1(3, "Sending Kinect tilt command of %x", cmd);
-			unsigned char usbdata[32];
-			libusb_control_transfer(ptzdev, 0x40, 0x31, cmd, 0x0, usbdata, sizeof(usbdata), 0);
+
+		if (tiltcmd < -30)
+		{
+			PLAYER_WARN1("Kinect tilt command (%d deg) out of range, limiting to (-30 deg)", tiltcmd);
+		}
+		else if (tiltcmd > 30)
+		{
+			PLAYER_WARN1("Kinect tilt command (%d deg) out of range, limiting to (+30 deg)", tiltcmd);
+		}
+
+		// Only do something if the last command
+		if (tiltcmd != round(this->ptzdata.tilt))
+		{
+			freenect_set_tilt_degs(fdev, (double)tiltcmd);
 
 			this->ptzdata.tilt = ptzcmd->tilt;
 		}
@@ -517,15 +490,21 @@ int KinectDriver::PublishPTZ()
 
 int KinectDriver::PublishAccelerometer()
 {
-	unsigned char usbdata[32];
-	libusb_control_transfer(ptzdev, 0xC0, 0x32, 0x0, 0x0, usbdata, sizeof(usbdata), 2);
-	imudata.accel_x = (int8_t)(usbdata[2] << 8 | usbdata[3]);
-	imudata.accel_y = (int8_t)(usbdata[4] << 8 | usbdata[5]);
-	imudata.accel_z = (int8_t)(usbdata[6] << 8 | usbdata[7]);
+	double x, y, z;
+	if( freenect_get_mks_accel(fdev, &x, &y, &z) >= 0 )
+	{
+	imudata.accel_x = x;
+	imudata.accel_y = y;
+	imudata.accel_z = z;
 
 	Publish(this->imu_id, PLAYER_MSGTYPE_DATA, PLAYER_IMU_DATA_CALIB, (void*)&imudata, sizeof(imudata));
-
 	return 0;
+	}
+	else
+	{
+		PLAYER_WARN("Error retrieving accelerometer data.");
+		return -1;
+	}
 }
 ////////////////////////////////////////////////////////////////////////////////
 // Main function for device thread
@@ -553,13 +532,24 @@ void KinectDriver::Main()
 		{
 			PublishDepthImage();
 		}
+
 		double now;
 		GlobalTime->GetTimeDouble(&now);
+		// If this happens on every iteration, the image frames
+		// don't get through.  Limit it to updating 20 times a second
 		if (provideimu && (now - last_acc_pub) > .05)
 		{
 			PublishAccelerometer();
-			GlobalTime->GetTimeDouble(&last_acc_pub);
+			last_acc_pub = now;
 		}
+		if (provideptz && (now - last_ptz_pub) > 0.5)
+		{
+			PublishPTZ();
+			last_ptz_pub = now;
+		}
+
+		// Sleep so we don't kill the processor
+		usleep(10);
 	}
 }
 ////////////////////////////////////////////////////////////////////////////////
