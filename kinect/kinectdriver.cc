@@ -134,11 +134,9 @@ private:
 	int PublishPTZ();
 	int PublishAccelerometer();
 
-	// Handle to the kinect usb object
+	// Handles for libfreenect
 	freenect_context *fctx;
 	freenect_device *fdev;
-	libusb_device_handle *usbdev;
-	libusb_device_handle *ptzdev;
 
 	// Device addresses for all possible provided interfaces
 	player_devaddr_t color_camera_id;
@@ -146,7 +144,7 @@ private:
 	player_devaddr_t ptz_id;
 	player_devaddr_t imu_id;
 
-	// Storage for outgoing camera data
+	// Storage for outgoing interface data
 	player_camera_data_t colordata;
 	player_camera_data_t depthdata;
 	player_ptz_data_t ptzdata;
@@ -157,6 +155,7 @@ private:
 	int provideptz;
 	int provideimu;
 
+	// Timers for publishing ptz and accelerometers regularly
 	double last_acc_pub;
 	double last_ptz_pub;
 
@@ -164,7 +163,7 @@ private:
 	int heatmap;
 	int downsample;
 
-
+	// Lookup table for depth image colorization
 	uint16_t t_gamma[2048];
 };
 
@@ -196,7 +195,7 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 	//Add interface from Configuration File
 	if (cf->ReadDeviceAddr(&(this->color_camera_id), section, "provides", PLAYER_CAMERA_CODE, -1, "image"))
 	{
-		PLAYER_ERROR("Kinect's Camera interface not started: config file doesn't provide image:::camera.");
+		PLAYER_ERROR("Kinect's Camera interface not started: config file doesn't provide \"image:::camera:n\"");
 		this->SetError(-1);
 		return;
 	}
@@ -208,7 +207,7 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 	}
 	if (cf->ReadDeviceAddr(&(this->depth_camera_id), section, "provides", PLAYER_CAMERA_CODE, -1, "depth"))
 	{
-		PLAYER_WARN("Kinect's Depth interface not started: config file doesn't provide depth:::camera.");
+		PLAYER_WARN("Kinect's Depth interface not started: config file doesn't provide \"depth:::camera:n\"");
 	}
 	else{
 		if (this->AddInterface(this->depth_camera_id))
@@ -249,13 +248,11 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 		}
 		provideimu = 1;
 	}
+
 	// Read config file options
 	heatmap = cf->ReadBool(section, "heatmap", false);
 	downsample = cf->ReadBool(section, "downsample", false);
 
-	// Assign pointers
-	usbdev = NULL;
-	ptzdev = NULL;
 
 	// Initialize the color map lookup table
 	for (int i=0; i<2048; i++) {
@@ -324,9 +321,7 @@ int KinectDriver::ProcessMessage(QueuePointer & resp_queue,
 	if (Message::MatchMessage(hdr, PLAYER_MSGTYPE_CMD, PLAYER_PTZ_CMD_STATE, this->ptz_id))
 	{
 		player_ptz_cmd_t *ptzcmd = (player_ptz_cmd_t*) data;
-
 		int tiltcmd = round(ptzcmd->tilt * 180.0 / M_PI);
-
 
 		if (tiltcmd < -30)
 		{
@@ -337,16 +332,16 @@ int KinectDriver::ProcessMessage(QueuePointer & resp_queue,
 			PLAYER_WARN1("Kinect tilt command (%d deg) out of range, limiting to (+30 deg)", tiltcmd);
 		}
 
-		// Only do something if the last command
+		// Only do something if the last command is different from the current one
 		if (tiltcmd != round(this->ptzdata.tilt))
 		{
 			freenect_set_tilt_degs(fdev, (double)tiltcmd);
-
 			this->ptzdata.tilt = ptzcmd->tilt;
 		}
 		return 0;
 	}
-	// This driver does not handle incoming messages, return -1
+
+	// Don't understand the message, return with an error
 	return(-1);
 }
 ////////////////////////////////////////////////////////////////////////////////
