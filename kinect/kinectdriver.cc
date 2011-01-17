@@ -1,5 +1,5 @@
 /*
- *	Kinect Driver for Player
+ *  Kinect Driver for Player
  *  Copyright (C) 2010
  *     Rich Mattes
  *
@@ -34,12 +34,11 @@ This driver is based on the original version of the libfreenect API, which
 is currently under heavy development.
 
 Heatmap code and USB connection code based on "glview" example in libfreenect
-project:
-http://github.com/OpenKinect/libfreenect
+project.
 
 @par Compile-time dependencies
 
-- none
+- libfreenect - http://github.com/OpenKinect/libfreenect
 
 @par Requires
 
@@ -84,7 +83,7 @@ driver
  */
 /** @} */
 
-//TODO: Add support for LEDs
+//TODO: Add support for LEDs, pointcloud
 
 #if !defined (WIN32)
 #include <unistd.h>
@@ -98,8 +97,8 @@ driver
 
 
 // Callback functions for processing depth and color image buffers
-void DepthImageCallback(freenect_device *dev, freenect_depth *depth, uint32_t timestamp);
-void ColorImageCallback(freenect_device *dev, freenect_pixel *rgb, uint32_t timestamp);
+void DepthImageCallback(freenect_device *dev, void *depth, uint32_t timestamp);
+void ColorImageCallback(freenect_device *dev, void *rgb, uint32_t timestamp);
 
 // Storage for image data and metadata
 static uint16_t* DepthImage;
@@ -283,15 +282,15 @@ int KinectDriver::MainSetup()
 	}
 
 	freenect_set_depth_callback(fdev, DepthImageCallback);
-	freenect_set_rgb_callback(fdev, ColorImageCallback);
-	freenect_set_rgb_format(fdev, FREENECT_FORMAT_RGB);
-	freenect_set_depth_format(fdev, FREENECT_FORMAT_11_BIT);
+	freenect_set_video_callback(fdev, ColorImageCallback);
+	freenect_set_video_format(fdev, FREENECT_VIDEO_RGB);
+	freenect_set_depth_format(fdev, FREENECT_DEPTH_11BIT);
 
 	colordata.image = NULL;
 	depthdata.image = NULL;
 
 	freenect_start_depth(fdev);
-	freenect_start_rgb(fdev);
+	freenect_start_video(fdev);
 
 	last_acc_pub = 0;
 	last_ptz_pub = 0;
@@ -306,7 +305,7 @@ void KinectDriver::MainQuit()
 	PLAYER_MSG0(2,"Kinect driver shutting down...");
 
 	freenect_stop_depth(fdev);
-	freenect_stop_rgb(fdev);
+	freenect_stop_video(fdev);
 	freenect_shutdown(fctx);
 
 	PLAYER_MSG0(2,"Kinect driver has been shut down.");
@@ -351,18 +350,18 @@ int KinectDriver::PublishColorImage()
 	if (colordata.image){
 		delete[] colordata.image;
 	}
-	colordata.image = new uint8_t[FREENECT_RGB_SIZE];
+	colordata.image = new uint8_t[FREENECT_VIDEO_RGB_SIZE];
 
 	pthread_mutex_lock(&kinect_mutex);
 	colordata.width = FREENECT_FRAME_W;
 	colordata.height = FREENECT_FRAME_H;
-	memcpy(colordata.image, ColorImage, FREENECT_RGB_SIZE);
+	memcpy(colordata.image, ColorImage, FREENECT_VIDEO_RGB_SIZE);
 	pthread_mutex_unlock(&kinect_mutex);
 
 	colordata.bpp = 24;
 	colordata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 	colordata.fdiv = 1;
-	colordata.image_count = FREENECT_RGB_SIZE;
+	colordata.image_count = FREENECT_VIDEO_RGB_SIZE;
 	colordata.format = PLAYER_CAMERA_FORMAT_RGB888;
 
 	PLAYER_MSG2(4,"Writing Color Image size %d, %d", colordata.width, colordata.height);
@@ -380,7 +379,7 @@ int KinectDriver::PublishDepthImage()
 	if (depthdata.image){
 		delete[] depthdata.image;
 	}
-	depthdata.image = new uint8_t[FREENECT_RGB_SIZE];
+	depthdata.image = new uint8_t[FREENECT_VIDEO_RGB_SIZE];
 
 	if (heatmap) // Publish colorized RGB888
 	{
@@ -433,7 +432,7 @@ int KinectDriver::PublishDepthImage()
 		depthdata.bpp = 24;
 		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 		depthdata.fdiv = 1;
-		depthdata.image_count = FREENECT_RGB_SIZE;
+		depthdata.image_count = FREENECT_VIDEO_RGB_SIZE;
 		depthdata.format = PLAYER_CAMERA_FORMAT_RGB888;
 	}
 	else if (downsample) //Publish downsampled MONO8
@@ -460,14 +459,14 @@ int KinectDriver::PublishDepthImage()
 		pthread_mutex_lock(&kinect_mutex);
 		depthdata.width = FREENECT_FRAME_W;
 		depthdata.height = FREENECT_FRAME_H;
-		memcpy((void*)depthdata.image, (void*)DepthImage, FREENECT_DEPTH_SIZE);
+		memcpy((void*)depthdata.image, (void*)DepthImage, FREENECT_DEPTH_11BIT_SIZE);
 		pthread_mutex_unlock(&kinect_mutex);
 
 
 		depthdata.bpp = 16;
 		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 		depthdata.fdiv = 1;
-		depthdata.image_count = FREENECT_DEPTH_SIZE;
+		depthdata.image_count = FREENECT_DEPTH_11BIT_SIZE;
 		depthdata.format = PLAYER_CAMERA_FORMAT_MONO16;
 	}
 
@@ -486,8 +485,10 @@ int KinectDriver::PublishPTZ()
 int KinectDriver::PublishAccelerometer()
 {
 	double x, y, z;
-	if( freenect_get_mks_accel(fdev, &x, &y, &z) >= 0 )
+	freenect_raw_tilt_state *rawstate = freenect_get_tilt_state(fdev);
+	if( rawstate )
 	{
+	freenect_get_mks_accel(rawstate, &x, &y, &z);
 	imudata.accel_x = x;
 	imudata.accel_y = y;
 	imudata.accel_z = z;
@@ -549,7 +550,7 @@ void KinectDriver::Main()
 }
 ////////////////////////////////////////////////////////////////////////////////
 // Grab depth image buffer returned by libfreenect and store it in a static buffer
-void DepthImageCallback(freenect_device *dev, freenect_depth *imagedata, uint32_t timestamp)
+void DepthImageCallback(freenect_device *dev, void *imagedata, uint32_t timestamp)
 {
 	pthread_mutex_lock(&kinect_mutex);
 	if(DepthImage)
@@ -557,23 +558,23 @@ void DepthImageCallback(freenect_device *dev, freenect_depth *imagedata, uint32_
 		delete[] DepthImage;
 	}
 
-	DepthImage = new uint16_t[FREENECT_DEPTH_SIZE];
-	memcpy(DepthImage, imagedata, FREENECT_DEPTH_SIZE);
+	DepthImage = new uint16_t[FREENECT_DEPTH_11BIT_SIZE];
+	memcpy(DepthImage, imagedata, FREENECT_DEPTH_11BIT_SIZE);
 	newddata = 1;
 	pthread_mutex_unlock(&kinect_mutex);
 	return;
 }
 ////////////////////////////////////////////////////////////////////////////////
 // Grab color image buffer returned by libfreenect and store it in a static buffer
-void ColorImageCallback(freenect_device *dev, freenect_pixel *imagedata, uint32_t timestamp)
+void ColorImageCallback(freenect_device *dev, void *imagedata, uint32_t timestamp)
 {
 	pthread_mutex_lock(&kinect_mutex);
 	if(ColorImage)
 	{
 		delete[] ColorImage;
 	}
-	ColorImage = new uint8_t[FREENECT_RGB_SIZE];
-	memcpy(ColorImage, imagedata, FREENECT_RGB_SIZE);
+	ColorImage = new uint8_t[FREENECT_VIDEO_RGB_SIZE];
+	memcpy(ColorImage, imagedata, FREENECT_VIDEO_RGB_SIZE);
 	newcdata = 1;
 	pthread_mutex_unlock(&kinect_mutex);
 	return;
