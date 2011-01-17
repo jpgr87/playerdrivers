@@ -325,14 +325,16 @@ int KinectDriver::ProcessMessage(QueuePointer & resp_queue,
 		if (tiltcmd < -30)
 		{
 			PLAYER_WARN1("Kinect tilt command (%d deg) out of range, limiting to (-30 deg)", tiltcmd);
+			tiltcmd = -30;
 		}
 		else if (tiltcmd > 30)
 		{
 			PLAYER_WARN1("Kinect tilt command (%d deg) out of range, limiting to (+30 deg)", tiltcmd);
+			tiltcmd = 30;
 		}
 
 		// Only do something if the last command is different from the current one
-		if (tiltcmd != round(this->ptzdata.tilt))
+		if (tiltcmd != round(this->ptzdata.tilt * 180.0 / M_PI))
 		{
 			freenect_set_tilt_degs(fdev, (double)tiltcmd);
 			this->ptzdata.tilt = ptzcmd->tilt;
@@ -484,23 +486,24 @@ int KinectDriver::PublishPTZ()
 
 int KinectDriver::PublishAccelerometer()
 {
-	double x, y, z;
-	freenect_raw_tilt_state *rawstate = freenect_get_tilt_state(fdev);
-	if( rawstate )
+	if (freenect_update_tilt_state(fdev))
 	{
-	freenect_get_mks_accel(rawstate, &x, &y, &z);
-	imudata.accel_x = x;
-	imudata.accel_y = y;
-	imudata.accel_z = z;
+		double x, y, z;
+		freenect_raw_tilt_state *rawstate = freenect_get_tilt_state(fdev);
+		if( rawstate )
+		{
+			freenect_get_mks_accel(rawstate, &x, &y, &z);
+			imudata.accel_x = x;
+			imudata.accel_y = y;
+			imudata.accel_z = z;
 
-	Publish(this->imu_id, PLAYER_MSGTYPE_DATA, PLAYER_IMU_DATA_CALIB, (void*)&imudata, sizeof(imudata));
-	return 0;
+			Publish(this->imu_id, PLAYER_MSGTYPE_DATA, PLAYER_IMU_DATA_CALIB, (void*)&imudata, sizeof(imudata));
+			return 0;
+		}
 	}
-	else
-	{
-		PLAYER_WARN("Error retrieving accelerometer data.");
-		return -1;
-	}
+	// Didn't get to return 0
+	PLAYER_WARN("Error retrieving accelerometer data.");
+	return -1;
 }
 ////////////////////////////////////////////////////////////////////////////////
 // Main function for device thread
