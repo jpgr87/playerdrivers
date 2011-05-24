@@ -1,6 +1,6 @@
 /*
  *  Kinect Driver for Player
- *  Copyright (C) 2010
+ *  Copyright (C) 2011
  *     Rich Mattes
  *
  *
@@ -25,12 +25,12 @@
 /** @defgroup driver_kinect kinect
  * @brief USB camera driver for Microsoft Kinect camera
 
-%Device driver for Microsoft Kinect webcams.  This driver handles processing
-the RGB Color images and the greyscale depth images provided by the Kinect.
-The Kinect also supports motor control for PTZ, accelerometers, audio and
-LED control, these capabilities are under development.
+Device driver for Microsoft Kinect webcams.  This driver handles processing
+the RGB Color images and the greyscale depth images provided by the Kinect,
+as well as motor control for PTZ, and reading the accelerometer.  The Kinect
+also supports audio and LED control, these capabilities are under development.
 
-This driver is based on the original version of the libfreenect API, which
+This driver is based on the latest version of the libfreenect API, which
 is currently under heavy development.
 
 Heatmap code and USB connection code based on "glview" example in libfreenect
@@ -39,6 +39,7 @@ project.
 @par Compile-time dependencies
 
 - libfreenect - http://github.com/OpenKinect/libfreenect
+- libusb-1.0 - http://www.libusb.org/wiki/libusb-1.0
 
 @par Requires
 
@@ -53,13 +54,13 @@ project.
 
 @par Configuration requests
 
-- none
+- None
 
 @par Configuration file options
 
 - heatmap (bool)
   - Default: false
-  - When set to false, the Depth image is published as a greyscale MONO16 image
+  - When set to false, the Depth image is published as a greyscale image
   - When set to true, the Depth image is colorized and published as an RGB heatmap
 
 - downsample (bool)
@@ -68,6 +69,18 @@ project.
   - When set to true, the Depth image is downsampled into a greyscale MONO8 image
   - If heatmap is set to true, this option has no effect.
 
+- color_resolution (enumeration)
+  - Default: 2
+  - Corresponds to the resolution of the color image frame.
+  - 2 = High Resolution = 1280x1024
+  - 1 = Med Resolution = 640x480
+
+- depth_resolution (enumeration)
+  - Default: 1
+  - Corresponds to the resolution of the depth image frame
+  - 1 = Med resolution = 640x488
+  - 0 = Low Resolution = 320x240
+
 @par Example
 
 @verbatim
@@ -75,7 +88,10 @@ driver
 (
   name "kinect"
   provides ["color:::camera:0" "depth:::camera:1" "ptz:0" "imu:0"]
-  heatmap 1
+  heatmap 0
+  downsample 1
+  color_resolution 2
+  depth_resolution 1
 )
 @endverbatim
 
@@ -83,7 +99,8 @@ driver
  */
 /** @} */
 
-//TODO: Add support for LEDs, pointcloud
+//TODO: Add support for LEDs, pointcloud, user-defined image sizes
+//TODO: Less judicious use of memcpy
 
 #if !defined (WIN32)
 #include <unistd.h>
@@ -105,6 +122,13 @@ static uint16_t* DepthImage;
 static uint8_t* ColorImage;
 static pthread_mutex_t kinect_mutex;
 static int newcdata, newddata;
+static freenect_frame_mode colorImageMode;
+static freenect_frame_mode depthImageMode;
+
+const bool DEFAULT_HEATMAP = false;
+const bool DEFAULT_DOWNSAMPLE = false;
+const int DEFAULT_COLOR_RESOLUTION = FREENECT_RESOLUTION_HIGH;
+const int DEFAULT_DEPTH_RESOLUTION = FREENECT_RESOLUTION_MEDIUM;
 
 ////////////////////////////////////////////////////////////////////////////////
 // The class for the driver
@@ -159,8 +183,10 @@ private:
 	double last_ptz_pub;
 
 	// Config file options
-	int heatmap;
-	int downsample;
+	BoolProperty heatmap;
+	BoolProperty downsample;
+	IntProperty color_resolution;
+	IntProperty depth_resolution;
 
 	// Lookup table for depth image colorization
 	uint16_t t_gamma[2048];
@@ -184,7 +210,11 @@ void KinectDriver_Register(DriverTable* table)
 // Constructor.  Retrieve options from the configuration file and do any
 // pre-Setup() setup.
 KinectDriver::KinectDriver(ConfigFile* cf, int section)
-: ThreadedDriver(cf, section)
+: ThreadedDriver(cf, section),
+  heatmap("heatmap", DEFAULT_HEATMAP, false),
+  downsample("downsample", DEFAULT_DOWNSAMPLE, false),
+  color_resolution("color_resolution", DEFAULT_COLOR_RESOLUTION, false),
+  depth_resolution("depth_resolution", DEFAULT_DEPTH_RESOLUTION, false)
 {
 	// Initialize flags:
 	providedepthimage = 0;
@@ -208,7 +238,8 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 	{
 		PLAYER_WARN("Kinect's Depth interface not started: config file doesn't provide \"depth:::camera:n\"");
 	}
-	else{
+	else
+	{
 		if (this->AddInterface(this->depth_camera_id))
 		{
 			PLAYER_ERROR("Kinect's Depth Camera interface failed to be added.");
@@ -249,8 +280,10 @@ KinectDriver::KinectDriver(ConfigFile* cf, int section)
 	}
 
 	// Read config file options
-	heatmap = cf->ReadBool(section, "heatmap", false);
-	downsample = cf->ReadBool(section, "downsample", false);
+	RegisterProperty("heatmap", &this->heatmap, cf, section);
+	RegisterProperty("downsample", &this->downsample, cf, section);
+	RegisterProperty("color_resolution", &this->color_resolution, cf, section);
+	RegisterProperty("depth_resolution", &this->depth_resolution, cf, section);
 
 
 	// Initialize the color map lookup table
@@ -280,11 +313,15 @@ int KinectDriver::MainSetup()
 		PLAYER_ERROR("Error opening Kinect");
 		return -1;
 	}
+	//Presto reduced the update size by 80% (from 305 M to 62 M).
+
 
 	freenect_set_depth_callback(fdev, DepthImageCallback);
 	freenect_set_video_callback(fdev, ColorImageCallback);
-	freenect_set_video_format(fdev, FREENECT_VIDEO_RGB);
-	freenect_set_depth_format(fdev, FREENECT_DEPTH_11BIT);
+	colorImageMode = freenect_find_video_mode((freenect_resolution)color_resolution.GetValue(), FREENECT_VIDEO_RGB);
+	freenect_set_video_mode(fdev, colorImageMode);
+	depthImageMode = freenect_find_depth_mode((freenect_resolution)depth_resolution.GetValue(), FREENECT_DEPTH_11BIT);
+	freenect_set_depth_mode(fdev, depthImageMode);
 
 	colordata.image = NULL;
 	depthdata.image = NULL;
@@ -317,6 +354,76 @@ int KinectDriver::ProcessMessage(QueuePointer & resp_queue,
 		player_msghdr * hdr,
 		void * data)
 {
+	// Respond to this so clients know that a NACK for every other request is intended
+	HANDLE_CAPABILITY_REQUEST (device_addr, resp_queue, hdr, data, PLAYER_MSGTYPE_REQ, PLAYER_CAPABILTIES_REQ);
+
+	if (Message::MatchMessage(hdr, PLAYER_MSGTYPE_REQ, PLAYER_SET_INTPROP_REQ, this->color_camera_id))
+	{
+		player_intprop_req_t *propreq = reinterpret_cast<player_intprop_req_t*>(data);
+		if (!strncmp(propreq->key, "color_resolution", 17))
+		{
+			int newres = propreq->value;
+			if (newres > FREENECT_RESOLUTION_HIGH || newres < FREENECT_RESOLUTION_LOW)
+			{
+				// Desired value is out of range, warn the user and ignore the request
+				PLAYER_WARN1("Property value %d for \"color_resolution\" is out of range, ignoring...", newres);
+				return -1;
+			}
+			else if(newres == colorImageMode.resolution)
+			{
+				// Already at this resolution, don't do anything and indicate that everything is fine
+				Publish(hdr->addr, resp_queue, PLAYER_MSGTYPE_RESP_ACK, PLAYER_SET_INTPROP_REQ, NULL, 0, NULL);
+				return 0;
+			}
+			else
+			{
+				PLAYER_WARN1("Setting color image resolution to %d", newres);
+				// Have a different resolution, do something about it.
+				freenect_stop_video(fdev);
+				pthread_mutex_lock(&kinect_mutex);
+				colorImageMode = freenect_find_video_mode((freenect_resolution)newres, FREENECT_VIDEO_RGB);
+				freenect_set_video_mode(fdev, colorImageMode);
+				pthread_mutex_unlock(&kinect_mutex);
+				freenect_start_video(fdev);
+				Publish(hdr->addr, resp_queue, PLAYER_MSGTYPE_RESP_ACK, PLAYER_SET_INTPROP_REQ, NULL, 0, NULL);
+				return 0;
+			}
+		}
+	}
+
+	if (Message::MatchMessage(hdr, PLAYER_MSGTYPE_REQ, PLAYER_SET_INTPROP_REQ, this->depth_camera_id))
+		{
+			player_intprop_req_t *propreq = reinterpret_cast<player_intprop_req_t*>(data);
+			if (!strncmp(propreq->key, "depth_resolution", 17))
+			{
+				int newres = propreq->value;
+				if (newres > FREENECT_RESOLUTION_MEDIUM || newres < FREENECT_RESOLUTION_LOW)
+				{
+					// Desired value is out of range, warn the user and ignore the request
+					PLAYER_WARN1("Property value %d for \"depth_resolution\" is out of range, ignoring...", newres);
+					return -1;
+				}
+				else if(newres == depthImageMode.resolution)
+				{
+					// Already at this resolution, don't do anything and indicate that everything is fine
+					Publish(hdr->addr, resp_queue, PLAYER_MSGTYPE_RESP_ACK, PLAYER_SET_INTPROP_REQ, NULL, 0, NULL);
+					return 0;
+				}
+				else
+				{
+					// Have a different resolution, do something about it.
+					freenect_stop_depth(fdev);
+					pthread_mutex_lock(&kinect_mutex);
+					colorImageMode = freenect_find_depth_mode((freenect_resolution)newres, FREENECT_DEPTH_11BIT);
+					freenect_set_depth_mode(fdev, depthImageMode);
+					pthread_mutex_unlock(&kinect_mutex);
+					freenect_start_depth(fdev);
+					Publish(hdr->addr, resp_queue, PLAYER_MSGTYPE_RESP_ACK, PLAYER_SET_INTPROP_REQ, NULL, 0, NULL);
+					return 0;
+				}
+			}
+		}
+
 	if (Message::MatchMessage(hdr, PLAYER_MSGTYPE_CMD, PLAYER_PTZ_CMD_STATE, this->ptz_id))
 	{
 		player_ptz_cmd_t *ptzcmd = (player_ptz_cmd_t*) data;
@@ -352,18 +459,18 @@ int KinectDriver::PublishColorImage()
 	if (colordata.image){
 		delete[] colordata.image;
 	}
-	colordata.image = new uint8_t[FREENECT_VIDEO_RGB_SIZE];
+	colordata.image = new uint8_t[colorImageMode.bytes];
 
 	pthread_mutex_lock(&kinect_mutex);
-	colordata.width = FREENECT_FRAME_W;
-	colordata.height = FREENECT_FRAME_H;
-	memcpy(colordata.image, ColorImage, FREENECT_VIDEO_RGB_SIZE);
+	colordata.width = colorImageMode.width;
+	colordata.height = colorImageMode.height;
+	memcpy(colordata.image, ColorImage, colorImageMode.bytes);
 	pthread_mutex_unlock(&kinect_mutex);
 
 	colordata.bpp = 24;
 	colordata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 	colordata.fdiv = 1;
-	colordata.image_count = FREENECT_VIDEO_RGB_SIZE;
+	colordata.image_count = colorImageMode.bytes;
 	colordata.format = PLAYER_CAMERA_FORMAT_RGB888;
 
 	PLAYER_MSG2(4,"Writing Color Image size %d, %d", colordata.width, colordata.height);
@@ -381,14 +488,15 @@ int KinectDriver::PublishDepthImage()
 	if (depthdata.image){
 		delete[] depthdata.image;
 	}
-	depthdata.image = new uint8_t[FREENECT_VIDEO_RGB_SIZE];
+	// Allocate space for maximum possible display image size (RGB888)
+	depthdata.image = new uint8_t[depthImageMode.width * depthImageMode.height * 3];
 
 	if (heatmap) // Publish colorized RGB888
 	{
 		pthread_mutex_lock(&kinect_mutex);
-		depthdata.width = FREENECT_FRAME_W;
-		depthdata.height = FREENECT_FRAME_H;
-		for (int i=0; i<FREENECT_FRAME_W*FREENECT_FRAME_H; i++) {
+		depthdata.width = depthImageMode.width;
+		depthdata.height = depthImageMode.height;
+		for (unsigned int i=0; i<depthdata.width*depthdata.height; i++) {
 			int pval = t_gamma[DepthImage[i]];
 			int lb = pval & 0xff;
 			switch (pval>>8) {
@@ -434,15 +542,15 @@ int KinectDriver::PublishDepthImage()
 		depthdata.bpp = 24;
 		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 		depthdata.fdiv = 1;
-		depthdata.image_count = FREENECT_VIDEO_RGB_SIZE;
+		depthdata.image_count = depthdata.width*depthdata.height*3;
 		depthdata.format = PLAYER_CAMERA_FORMAT_RGB888;
 	}
 	else if (downsample) //Publish downsampled MONO8
 	{
 		pthread_mutex_lock(&kinect_mutex);
-		depthdata.width = FREENECT_FRAME_W;
-		depthdata.height = FREENECT_FRAME_H;
-		for (int i=0; i < FREENECT_FRAME_W* FREENECT_FRAME_H; i++)
+		depthdata.width = depthImageMode.width;
+		depthdata.height = depthImageMode.height;
+		for (unsigned int i=0; i < depthdata.width* depthdata.height; i++)
 		{
 			uint16_t pixel = DepthImage[i];
 			uint8_t dpixel = (uint8_t)((double)pixel / 2048.0 * 255.0); 
@@ -453,22 +561,22 @@ int KinectDriver::PublishDepthImage()
 		depthdata.bpp = 8;
 		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 		depthdata.fdiv = 1;
-		depthdata.image_count = FREENECT_FRAME_W * FREENECT_FRAME_H;
+		depthdata.image_count = depthImageMode.width * depthImageMode.height;
 		depthdata.format = PLAYER_CAMERA_FORMAT_MONO8;
 	}
 	else // Publish MONO16	
 	{
 		pthread_mutex_lock(&kinect_mutex);
-		depthdata.width = FREENECT_FRAME_W;
-		depthdata.height = FREENECT_FRAME_H;
-		memcpy((void*)depthdata.image, (void*)DepthImage, FREENECT_DEPTH_11BIT_SIZE);
+		depthdata.width = depthImageMode.width;
+		depthdata.height = depthImageMode.height;
+		memcpy((void*)depthdata.image, (void*)DepthImage, depthImageMode.bytes);
 		pthread_mutex_unlock(&kinect_mutex);
 
 
 		depthdata.bpp = 16;
 		depthdata.compression = PLAYER_CAMERA_COMPRESS_RAW;
 		depthdata.fdiv = 1;
-		depthdata.image_count = FREENECT_DEPTH_11BIT_SIZE;
+		depthdata.image_count = depthImageMode.bytes;
 		depthdata.format = PLAYER_CAMERA_FORMAT_MONO16;
 	}
 
@@ -522,7 +630,8 @@ void KinectDriver::Main()
 		// called on each message.
 		ProcessMessages();
 
-		// Interact with the device, and push out the resulting data, using
+		// Check each camera to see if there's new data available
+		// from the callbacks.  If so, publish it.
 		if (newcdata)
 		{
 			PublishColorImage();
@@ -535,12 +644,14 @@ void KinectDriver::Main()
 		double now;
 		GlobalTime->GetTimeDouble(&now);
 		// If this happens on every iteration, the image frames
-		// don't get through.  Limit it to updating 20 times a second
+		// don't get through.  Limit it to updating 20ish times a second
 		if (provideimu && (now - last_acc_pub) > .05)
 		{
 			PublishAccelerometer();
 			last_acc_pub = now;
 		}
+		// PTZ state data isn't terribly important, publish every
+		// half second or so.
 		if (provideptz && (now - last_ptz_pub) > 0.5)
 		{
 			PublishPTZ();
@@ -561,8 +672,8 @@ void DepthImageCallback(freenect_device *dev, void *imagedata, uint32_t timestam
 		delete[] DepthImage;
 	}
 
-	DepthImage = new uint16_t[FREENECT_DEPTH_11BIT_SIZE];
-	memcpy(DepthImage, imagedata, FREENECT_DEPTH_11BIT_SIZE);
+	DepthImage = new uint16_t[depthImageMode.bytes];
+	memcpy(DepthImage, imagedata, depthImageMode.bytes);
 	newddata = 1;
 	pthread_mutex_unlock(&kinect_mutex);
 	return;
@@ -576,8 +687,8 @@ void ColorImageCallback(freenect_device *dev, void *imagedata, uint32_t timestam
 	{
 		delete[] ColorImage;
 	}
-	ColorImage = new uint8_t[FREENECT_VIDEO_RGB_SIZE];
-	memcpy(ColorImage, imagedata, FREENECT_VIDEO_RGB_SIZE);
+	ColorImage = new uint8_t[colorImageMode.bytes];
+	memcpy(ColorImage, imagedata, colorImageMode.bytes);
 	newcdata = 1;
 	pthread_mutex_unlock(&kinect_mutex);
 	return;
